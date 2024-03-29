@@ -8,15 +8,18 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 	"time"
+	"math/big"
 
 	"github.com/docopt/docopt-go"
-	"golang.org/x/crypto/argon2"
+
+	"dsw/df"
 )
 
 // This is not a serious implementation. A serious implementation would:
@@ -37,12 +40,9 @@ Usage:
 Make sure to save your initial seed words and the checkpoint input.
 `
 
-type Argon2Params struct {
-	memory     uint32
-	iterations uint32
-	threads    uint8
-	keyLen     uint32
-}
+// Assumption about worst case iterations per second
+// ~ 4.5s unoptimised on a potato PC using the benchmark
+var iterations_per_second uint64 = 100000
 
 func main() {
 	var err error
@@ -56,12 +56,10 @@ func main() {
 		return
 	}
 
-	// Params for ~1 second on my PC
-	p := &Argon2Params{
-		memory:     64 * 1024,
-		iterations: 100,
-		threads:    16,
-		keyLen:     32,
+	target, err := time.ParseDuration("10m")
+	if err != nil {
+		fmt.Println(err.Error())
+		return
 	}
 
 	wordlist := ReadWords()
@@ -74,7 +72,7 @@ func main() {
 			fmt.Println("Error: seed words passed is not 24 words.")
 			return
 		}
-		finalInput, err := Create(43200, 5, []byte(seed), p, verbose)
+		finalInput, err := Create(target, []byte(seed), verbose)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -87,7 +85,7 @@ func main() {
 			fmt.Println("Error: seed words passed is not 24 words.")
 			return
 		}
-		finalInput, err := Recover(43200, 5, []byte(seed), p, verbose)
+		finalInput, err := Recover([]byte(seed), verbose)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -98,23 +96,18 @@ func main() {
 }
 
 // Starts with an input passed and builds a hashchain of length n from it
-func BuildHashchain(n int, input []byte, p *Argon2Params, verbose bool) ([]byte, error) {
-	var err error
-	var hash []byte
-
+func BuildHashchain(n uint64, input *big.Int, eval func (df.Element, uint64) df.Element, verbose bool) (*big.Int, error) {
+	step := 10*iterations_per_second
 	start := time.Now()
-	for i := 0; i < n; i++ {
-		hash, err = H(input, p)
-		if err != nil {
-			log.Fatal(err)
+	for i := uint64(0); i < n; i+= step {
+		k := step
+		if i+k > n {
+			k = n - i
 		}
+		input = eval(input, k)
 		if verbose {
 			fmt.Println("Iterations left: ", n-i)
-			fmt.Println(hex.EncodeToString(hash))
-		}
-		input = hash
-		if i%1000 == 0 {
-			fmt.Println("i:", i)
+			fmt.Println(hex.EncodeToString(input.Bytes()))
 		}
 	}
 	elapsed := time.Since(start)
@@ -126,41 +119,47 @@ func BuildHashchain(n int, input []byte, p *Argon2Params, verbose bool) ([]byte,
 }
 
 // Computes the left side of the hashchain (up to the checkpoint)
-func ComputeLeft(n int, input []byte, p *Argon2Params, verbose bool) []byte {
-	// Builds the hashchain up to the checkpoint
-	input, err := BuildHashchain(n, input, p, verbose)
-	if err != nil {
-		log.Fatal(err)
-	}
+func ComputeLeft(n uint64, input []byte, verbose bool) {
 	// Derive the username and password for the notifier in case we need it
 	username, password := DeriveUsernamePassword(input)
 	fmt.Println("Email username:", username)
 	fmt.Println("Email password:", password)
 	fmt.Println("")
-
-	return input
 }
 
 // Computes the right side of the hashchain (from the checkpoint to the end)
-func ComputeRight(n int, input []byte, p *Argon2Params, verbose bool) []byte {
-	finalInput, err := BuildHashchain(n, input, p, verbose)
+func ComputeRight(n uint64, input df.Element, eval func (df.Element, uint64) df.Element, verbose bool) []byte {
+	finalInput, err := BuildHashchain(n, input, eval, verbose)
 	if err != nil {
 		log.Fatal(err)
 	}
-	return finalInput
+	return finalInput.Bytes()
+}
+
+type checkpoint struct {
+	Mod *big.Int `json:"mod"`
+	Iterations uint64 `json:"iterations"`
 }
 
 // Creates a hashchain of length N with M being the checkpoint. The genesis is the given input
-func Create(n int, m int, input []byte, p *Argon2Params, verbose bool) ([]byte, error) {
-	leftInput := ComputeLeft(m, input, p, verbose)
+func Create(target time.Duration, input []byte, verbose bool) ([]byte, error) {
+	ComputeLeft(0, input, verbose)
 
-	// Create a random checkpoint input
-	checkpointInput, err := RndBytes(32)
+	params, err := df.NewRsaGroup(rand.Reader)
 	if err != nil {
 		log.Fatal(err)
 	}
-	checkpointInputHex := hex.EncodeToString(checkpointInput)
-	fmt.Println("Generated checkpoint input: ", checkpointInputHex)
+	iterations := uint64(target.Seconds()) * iterations_per_second
+	// Create a random checkpoint input
+	checkpointInput := &checkpoint{Mod: params.Mod, Iterations: iterations}
+	if err != nil {
+		log.Fatal(err)
+	}
+	checkpointInputJson, err := json.Marshal(checkpointInput)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Generated checkpoint input: %s\n", checkpointInputJson)
 	// Confirmation step
 	fmt.Println(`
 Save the checkpoint input to your notifier.
@@ -179,19 +178,19 @@ Once you're done, please copy the checkpoint input and paste it here to confirm 
 	if err != nil {
 		log.Fatal(err)
 	}
-	if checkpointInputStr != checkpointInputHex {
+	if checkpointInputStr != string(checkpointInputJson) {
 		log.Fatal("Incorrect paste of the checkpoint input. Exiting.")
 	}
 
 	// Add the checkpoint input to our input and compute the right side
-	joinedCheckpointInput := append(leftInput[:], checkpointInput[:]...)
-	finalInput := ComputeRight(n-m, joinedCheckpointInput, p, verbose)
+
+	finalInput := ComputeRight(checkpointInput.Iterations, params.HashToGroup(input), params.FastEval, verbose)
 	return finalInput, nil
 }
 
 // Recovers a hashchain of length N with M being the checkpoint. The genesis is the given input
-func Recover(n int, m int, input []byte, p *Argon2Params, verbose bool) ([]byte, error) {
-	leftInput := ComputeLeft(m, input, p, verbose)
+func Recover(input []byte, verbose bool) ([]byte, error) {
+	ComputeLeft(0, input, verbose)
 
 	// Ask the user to provide the checkpoint input
 	fmt.Println(`Please get the checkpoint input from your notifier (i.e. email) and paste it below.
@@ -207,14 +206,16 @@ Paste the checkpoint input here:`)
 	if err != nil {
 		log.Fatal(err)
 	}
-	checkpointInput, err := hex.DecodeString(checkpointInputStr)
+	var checkpointInput checkpoint
+	json.Unmarshal([]byte(checkpointInputStr), &checkpointInput)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	params := &df.RsaGroup{Mod: checkpointInput.Mod}
+
 	// Add the checkpoint input to our input and compute the right side
-	joinedCheckpointInput := append(leftInput[:], checkpointInput[:]...)
-	finalInput := ComputeRight(n-m, joinedCheckpointInput, p, verbose)
+	finalInput := ComputeRight(checkpointInput.Iterations, params.HashToGroup(input), params.Eval, verbose)
 	return finalInput, nil
 }
 
@@ -242,24 +243,6 @@ func H2Seed(hash []byte, wordlist []string) []string {
 	}
 
 	return result
-}
-
-// Computes the Argon2 hash
-func H(input []byte, p *Argon2Params) ([]byte, error) {
-	salt := []byte{}
-	hash := argon2.IDKey(input, salt, p.iterations, p.memory, p.threads, p.keyLen)
-
-	return hash, nil
-}
-
-func RndBytes(n uint32) ([]byte, error) {
-	b := make([]byte, n)
-	_, err := rand.Read(b)
-	if err != nil {
-		return nil, err
-	}
-
-	return b, nil
 }
 
 // Reads the BIP39 words
